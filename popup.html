@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>HighLevel Bulk Feature Manager</title>
+  <link rel="stylesheet" href="popup.css">
+  <meta name="popup" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+</head>
+<body tabindex="0">
+  <div class="container">
+    <h2>Bulk Feature Manager</h2>
+    
+    <div id="auth-status" class="status-box">
+      Waiting for authentication data...
+    </div>
+
+    <div id="location-info" class="info-box" style="display: none;">
+      <h3>Locations Found: <span id="location-count">0</span></h3>
+      <div class="location-list" id="location-list"></div>
+    </div>
+
+    <div id="feature-controls" class="controls" style="display: none;">
+      <h3>Feature Controls</h3>
+      <select id="feature-select">
+        <option value="sms-validation">SMS Validation</option>
+        <option value="call-recording">Call Recording</option>
+      </select>
+      <div class="button-group">
+        <button id="enable-btn">Enable</button>
+        <button id="disable-btn">Disable</button>
+      </div>
+    </div>
+
+    <div id="progress" class="progress-box" style="display: none;">
+      <h3>Progress</h3>
+      <div class="progress-bar">
+        <div id="progress-fill"></div>
+      </div>
+      <div id="progress-text"></div>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html> 
