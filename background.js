@@ -1,179 +1,215 @@
-// Store auth data and locations
-let authData = null;
-let locationIds = [];
+// Debug flag
+const DEBUG = true;
 
-// Listen for webRequest to capture auth data and locations
-chrome.webRequest.onBeforeSendHeaders.addListener(
-  function(details) {
-    if (details.url.includes('backend.leadconnectorhq.com/locations/search')) {
-      const headers = {};
-      const headerMap = new Map(details.requestHeaders.map(h => [h.name.toLowerCase(), h.value]));
+// Constants
+const TARGET_URL = 'backend.leadconnectorhq.com/locations/search';
+const DEBUGGER_VERSION = '1.2';
+
+// Track attached debuggers
+const attachedTabs = new Set();
+
+// Track requests
+const pendingRequests = new Map();
+
+/**
+ * Debug logging utility
+ * @param {...any} args - Items to log
+ */
+function debugLog(...args) {
+  if (DEBUG) {
+    console.log('[Bulk Operations Helper - Background]', ...args);
+  }
+}
+
+/**
+ * Stores captured data in chrome.storage
+ * @param {Object} data - Data to store
+ */
+async function storeData(data) {
+  try {
+    await chrome.storage.local.set(data);
+    debugLog('Data stored successfully:', data);
+  } catch (error) {
+    console.error('Error storing data:', error);
+  }
+}
+
+/**
+ * Gets header value case-insensitively
+ * @param {Object} headers - Headers object
+ * @param {string} headerName - Name of header to find
+ * @returns {string|undefined} Header value
+ */
+function getHeaderCaseInsensitive(headers, headerName) {
+  const headerKey = Object.keys(headers).find(
+    key => key.toLowerCase() === headerName.toLowerCase()
+  );
+  return headerKey ? headers[headerKey] : undefined;
+}
+
+/**
+ * Handles network request events
+ * @param {Object} debuggeeId - The debugging target
+ * @param {string} method - The network event method
+ * @param {Object} params - Event parameters
+ */
+async function handleNetworkEvent(debuggeeId, method, params) {
+  try {
+    // Handle request initiation
+    if (method === 'Network.requestWillBeSent') {
+      const { request, requestId } = params;
       
-      const authToken = headerMap.get('authorization');
-      const tokenId = headerMap.get('token-id');
-      
-      if (authToken && tokenId) {
-        authData = {
-          bearerToken: authToken,
-          tokenId: tokenId,
-          companyId: new URL(details.url).searchParams.get('companyId'),
-          headers: {
-            'authorization': authToken,
-            'token-id': tokenId,
-            'channel': 'APP',
-            'source': 'WEB_USER',
-            'content-type': 'application/json',
-            'accept': 'application/json, text/plain, */*',
-            'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8'
-          }
+      // Skip OPTIONS requests
+      if (request.method === 'OPTIONS') {
+        return;
+      }
+
+      if (request.url.includes(TARGET_URL)) {
+        debugLog('Target request intercepted:', request.url);
+        debugLog('Request headers:', request.headers);
+        
+        // Store headers case-insensitively
+        const headers = {
+          authorization: getHeaderCaseInsensitive(request.headers, 'authorization'),
+          'token-id': getHeaderCaseInsensitive(request.headers, 'token-id'),
+          channel: 'APP',
+          source: 'WEB_USER'
         };
 
-        // Store in chrome.storage
-        chrome.storage.local.set({ authData });
+        // Store request info for later
+        pendingRequests.set(requestId, {
+          url: request.url,
+          headers
+        });
+
+        await storeData({ headers });
+        debugLog('Headers stored:', headers);
       }
     }
-    return { requestHeaders: details.requestHeaders };
-  },
-  { urls: ["*://backend.leadconnectorhq.com/*"] },
-  ["requestHeaders"]
-);
+    
+    // Handle response loading complete
+    if (method === 'Network.loadingFinished') {
+      const { requestId } = params;
+      
+      // Check if this is a request we're tracking
+      const requestInfo = pendingRequests.get(requestId);
+      if (!requestInfo) {
+        return;
+      }
 
-// Capture the response data to get location IDs
-chrome.webRequest.onCompleted.addListener(
-  async function(details) {
-    if (details.url.includes('backend.leadconnectorhq.com/locations/search')) {
       try {
-        // Fetch the response data
-        const response = await fetch(details.url, {
-          headers: authData.headers
-        });
-        const data = await response.json();
-        
-        if (data && Array.isArray(data.locations)) {
-          locationIds = data.locations
-            .filter(loc => loc && loc.id)
-            .map(loc => loc.id);
-          
-          // Store locations in chrome.storage
-          chrome.storage.local.set({ locationIds });
-          
-          log('Captured locations:', locationIds);
+        debugLog('Getting response body for request:', requestId);
+        const bodyResponse = await chrome.debugger.sendCommand(
+          { tabId: debuggeeId.tabId },
+          'Network.getResponseBody',
+          { requestId }
+        );
+
+        if (bodyResponse && bodyResponse.body) {
+          const data = JSON.parse(bodyResponse.body);
+          debugLog('Response body:', data);
+
+          if (data.locations && Array.isArray(data.locations)) {
+            const locationIds = data.locations.map(loc => loc._id);
+            debugLog('Extracted location IDs:', locationIds);
+            await storeData({ locationIds });
+          }
         }
       } catch (error) {
-        log('Error capturing locations:', error);
+        debugLog('Could not get response body:', error.message);
+      } finally {
+        // Clean up
+        pendingRequests.delete(requestId);
       }
     }
-  },
-  { urls: ["*://backend.leadconnectorhq.com/*"] }
-);
 
-// Update message listener
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.type === 'BULK_UPDATE_FEATURE') {
-    handleBulkUpdate(request.data)
-      .then(result => sendResponse(result))
-      .catch(error => sendResponse({ error: error.message }));
-    return true;
+    // Handle response received (for error cases)
+    if (method === 'Network.responseReceived') {
+      const { requestId, response } = params;
+      
+      const requestInfo = pendingRequests.get(requestId);
+      if (!requestInfo) {
+        return;
+      }
+
+      if (response.status !== 200) {
+        debugLog('Non-200 response:', response.status);
+        pendingRequests.delete(requestId);
+      }
+    }
+  } catch (error) {
+    console.error('Error handling network event:', error);
   }
-  
-  if (request.type === 'GET_DATA') {
-    sendResponse({ authData, locationIds });
-    return true;
+}
+
+/**
+ * Attaches debugger to a tab if not already attached
+ * @param {number} tabId - ID of the tab to debug
+ */
+async function attachDebugger(tabId) {
+  if (attachedTabs.has(tabId)) {
+    debugLog('Debugger already attached to tab:', tabId);
+    return;
+  }
+
+  try {
+    debugLog('Attaching debugger to tab:', tabId);
+    
+    // Attach debugger
+    await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+    attachedTabs.add(tabId);
+    debugLog('Debugger attached successfully');
+
+    // Enable network tracking
+    await chrome.debugger.sendCommand({ tabId }, 'Network.enable');
+    debugLog('Network tracking enabled');
+  } catch (error) {
+    console.error('Error attaching debugger:', error);
+  }
+}
+
+/**
+ * Detaches debugger from a tab
+ * @param {number} tabId - ID of the tab to detach from
+ */
+async function detachDebugger(tabId) {
+  if (!attachedTabs.has(tabId)) {
+    return;
+  }
+
+  try {
+    await chrome.debugger.detach({ tabId });
+    attachedTabs.delete(tabId);
+    debugLog('Debugger detached from tab:', tabId);
+  } catch (error) {
+    console.error('Error detaching debugger:', error);
+  }
+}
+
+// Listen for tab updates
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === 'complete' && tab.url?.includes('app.gohighlevel.com')) {
+    attachDebugger(tabId);
   }
 });
 
-// Add logging utility
-function log(message, data = null) {
-  const timestamp = new Date().toISOString();
-  const logMessage = `[${timestamp}] ${message}`;
-  console.log(logMessage);
-  if (data) {
-    console.log(data);
+// Listen for tab removal
+chrome.tabs.onRemoved.addListener((tabId) => {
+  detachDebugger(tabId);
+});
+
+// Listen for debugger events
+chrome.debugger.onEvent.addListener(handleNetworkEvent);
+
+// Listen for debugger detached events
+chrome.debugger.onDetach.addListener((source) => {
+  if (source.tabId) {
+    attachedTabs.delete(source.tabId);
   }
-}
+  debugLog('Debugger detached:', source);
+});
 
-// Update makeApiCall function
-async function makeApiCall(url, method, headers, body, maxRetries = 3) {
-  // Ensure all required headers are present
-  const requestHeaders = {
-    'accept': 'application/json, text/plain, */*',
-    'accept-language': 'en-GB,en-US;q=0.9,en;q=0.8',
-    'content-type': 'application/json',
-    'channel': 'APP',
-    'source': 'WEB_USER',
-    ...headers  // Spread the captured headers
-  };
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      log(`Attempt ${attempt}: ${method} ${url}`);
-      log('Request Headers:', requestHeaders);
-      log('Request Body:', body);
-
-      const response = await fetch(url, {
-        method,
-        headers: requestHeaders,
-        body: body ? JSON.stringify(body) : undefined
-      });
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        log(`Error Response (${response.status}):`, errorText);
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-      
-      const responseData = await response.json();
-      log('Success Response:', responseData);
-      return responseData;
-    } catch (error) {
-      log(`Error in attempt ${attempt}:`, error.message);
-      if (attempt === maxRetries) throw error;
-      log(`Waiting ${2000 * attempt}ms before retry...`);
-      await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
-    }
-  }
-}
-
-// Update handleBulkUpdate function
-async function handleBulkUpdate({ locationIds, featureEndpoint, featurePayload, method = 'POST', queryParam = null }) {
-  const results = {
-    successful: [],
-    failed: [],
-    skipped: []
-  };
-
-  log(`Starting bulk update for ${locationIds.length} locations`);
-
-  for (const locationId of locationIds) {
-    try {
-      const url = queryParam 
-        ? `${featureEndpoint}?${queryParam}=${locationId}`
-        : featureEndpoint.replace('{locationId}', locationId);
-
-      log(`Processing location: ${locationId}`);
-      await makeApiCall(
-        url,
-        method,
-        authData.headers,
-        featurePayload
-      );
-      results.successful.push(locationId);
-      log(`Success for location: ${locationId}`);
-    } catch (error) {
-      log(`Error for location ${locationId}:`, error.message);
-      if (error.message.includes('No twilio account found')) {
-        results.skipped.push(locationId);
-        log(`Skipped location ${locationId}: No Twilio account`);
-      } else {
-        results.failed.push(locationId);
-        log(`Failed location ${locationId}: ${error.message}`);
-      }
-    }
-    // Increase delay to 500ms
-    log('Waiting 500ms before next location...');
-    await new Promise(resolve => setTimeout(resolve, 500));
-  }
-
-  log('Bulk update completed', results);
-  return results;
-} 
+// Handle extension installation/update
+chrome.runtime.onInstalled.addListener(() => {
+  debugLog('Extension installed/updated');
+}); 
