@@ -11,6 +11,13 @@ const attachedTabs = new Set();
 // Track requests
 const pendingRequests = new Map();
 
+// Track intercepted data
+let interceptedData = {
+  headers: {},
+  locationIds: [],
+  featurePattern: null
+};
+
 /**
  * Debug logging utility
  * @param {...any} args - Items to log
@@ -48,6 +55,15 @@ function getHeaderCaseInsensitive(headers, headerName) {
 }
 
 /**
+ * Checks if response status is successful
+ * @param {number} status - HTTP status code
+ * @returns {boolean} Whether the status code indicates success
+ */
+function isSuccessStatus(status) {
+  return status >= 200 && status < 300;
+}
+
+/**
  * Handles network request events
  * @param {Object} debuggeeId - The debugging target
  * @param {string} method - The network event method
@@ -64,6 +80,15 @@ async function handleNetworkEvent(debuggeeId, method, params) {
         return;
       }
 
+      // Store request info for later
+      pendingRequests.set(requestId, {
+        url: request.url,
+        method: request.method,
+        headers: request.headers,
+        body: request.postData
+      });
+
+      // Handle locations search request
       if (request.url.includes(TARGET_URL)) {
         debugLog('Target request intercepted:', request.url);
         debugLog('Request headers:', request.headers);
@@ -73,17 +98,45 @@ async function handleNetworkEvent(debuggeeId, method, params) {
           authorization: getHeaderCaseInsensitive(request.headers, 'authorization'),
           'token-id': getHeaderCaseInsensitive(request.headers, 'token-id'),
           channel: 'APP',
-          source: 'WEB_USER'
+          source: 'WEB_USER',
+          version: getHeaderCaseInsensitive(request.headers, 'version')
         };
 
-        // Store request info for later
-        pendingRequests.set(requestId, {
-          url: request.url,
-          headers
-        });
-
+        interceptedData.headers = headers;
         await storeData({ headers });
         debugLog('Headers stored:', headers);
+      }
+
+      // Check if we're recording feature patterns
+      const { isRecording } = await chrome.storage.local.get('isRecording');
+      if (isRecording && request.method !== 'GET') {
+        debugLog('Recording feature request:', request);
+        
+        // Store version header from successful requests
+        const version = getHeaderCaseInsensitive(request.headers, 'version');
+        if (version) {
+          const updatedHeaders = { 
+            ...interceptedData.headers, 
+            version 
+          };
+          interceptedData.headers = updatedHeaders;
+          await storeData({ headers: updatedHeaders });
+        }
+
+        // Store the request immediately for feature pattern
+        const featurePattern = {
+          url: request.url,
+          method: request.method,
+          headers: request.headers,
+          body: request.postData ? JSON.parse(request.postData) : null
+        };
+        
+        await storeData({ 
+          featurePattern,
+          isRecording: false // Stop recording after capturing pattern
+        });
+        
+        debugLog('Feature pattern stored:', featurePattern);
       }
     }
     
@@ -91,7 +144,7 @@ async function handleNetworkEvent(debuggeeId, method, params) {
     if (method === 'Network.loadingFinished') {
       const { requestId } = params;
       
-      // Check if this is a request we're tracking
+      // Get request info
       const requestInfo = pendingRequests.get(requestId);
       if (!requestInfo) {
         return;
@@ -105,7 +158,8 @@ async function handleNetworkEvent(debuggeeId, method, params) {
           { requestId }
         );
 
-        if (bodyResponse && bodyResponse.body) {
+        // Handle locations search response
+        if (requestInfo.url.includes(TARGET_URL) && bodyResponse?.body) {
           const data = JSON.parse(bodyResponse.body);
           debugLog('Response body:', data);
 
@@ -132,8 +186,8 @@ async function handleNetworkEvent(debuggeeId, method, params) {
         return;
       }
 
-      if (response.status !== 200) {
-        debugLog('Non-200 response:', response.status);
+      if (!isSuccessStatus(response.status)) {
+        debugLog('Non-success response:', response.status);
         pendingRequests.delete(requestId);
       }
     }

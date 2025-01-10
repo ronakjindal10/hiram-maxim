@@ -17,11 +17,15 @@ const locationCount = document.getElementById('locationCount');
 const startOperationBtn = document.getElementById('startOperation');
 const operationStatus = document.getElementById('operationStatus');
 const errorMessage = document.getElementById('errorMessage');
+const recordFeatureBtn = document.getElementById('recordFeature');
+const recordingStatus = document.getElementById('recordingStatus');
+const featurePattern = document.getElementById('featurePattern');
 
 // State
 let interceptedData = {
   headers: {},
-  locationIds: []
+  locationIds: [],
+  featurePattern: null
 };
 
 /**
@@ -43,30 +47,92 @@ function updateLocationList(locations) {
     .join('');
   
   locationCount.textContent = `Total locations: ${locations.length}`;
-  startOperationBtn.disabled = false;
+  startOperationBtn.disabled = !interceptedData.featurePattern;
+}
+
+/**
+ * Updates the feature pattern display
+ * @param {Object} pattern - Feature pattern object
+ */
+function updateFeaturePattern(pattern) {
+  debugLog('Updating feature pattern:', pattern);
+  
+  if (!pattern) {
+    featurePattern.innerHTML = '';
+    recordingStatus.innerHTML = `
+      <p class="status">No feature pattern recorded yet.</p>
+      <ol class="steps">
+        <li>Click 'Start Recording'</li>
+        <li>Navigate to any location</li>
+        <li>Toggle the feature you want to change</li>
+        <li>Click 'Stop Recording' to confirm</li>
+      </ol>
+    `;
+    recordFeatureBtn.textContent = 'Start Recording';
+    recordFeatureBtn.classList.remove('recording');
+    return;
+  }
+
+  featurePattern.innerHTML = `
+    <div class="feature-pattern">
+      URL: ${pattern.url}
+      Method: ${pattern.method}
+      Body: ${JSON.stringify(pattern.body, null, 2)}
+    </div>
+  `;
+  startOperationBtn.disabled = !interceptedData.locationIds.length;
+}
+
+/**
+ * Toggles feature recording mode
+ * @param {boolean} isRecording - Whether recording is active
+ */
+async function toggleRecording(isRecording) {
+  debugLog('Toggling recording:', isRecording);
+  
+  try {
+    await chrome.storage.local.set({ isRecording });
+    
+    if (isRecording) {
+      recordFeatureBtn.textContent = 'Stop Recording';
+      recordFeatureBtn.classList.add('recording');
+      recordingStatus.innerHTML = '<p class="status">Recording... Navigate to a location and toggle the feature.</p>';
+    } else {
+      recordFeatureBtn.textContent = 'Start Recording';
+      recordFeatureBtn.classList.remove('recording');
+    }
+  } catch (error) {
+    console.error('Error toggling recording:', error);
+    errorMessage.textContent = 'Error toggling recording mode';
+  }
 }
 
 /**
  * Performs operation on a single location
  * @param {string} locationId - Location ID
  * @param {Object} headers - Request headers
+ * @param {Object} pattern - Feature pattern
  */
-async function performOperation(locationId, headers) {
+async function performOperation(locationId, headers, pattern) {
   debugLog('Performing operation for location:', locationId);
   
-  const url = `https://backend.leadconnectorhq.com/phone-system/twilio-accounts?locationId=${locationId}`;
-  
   try {
+    const url = pattern.url;
     const response = await fetch(url, {
-      method: 'PUT',
+      method: pattern.method,
       headers: {
         'accept': 'application/json',
         'content-type': 'application/json',
-        ...headers
+        'authorization': headers.authorization,
+        'token-id': headers['token-id'],
+        'channel': headers.channel || 'APP',
+        'source': headers.source || 'WEB_USER',
+        'version': headers.version || pattern.headers?.version || '2021-07-28',
+        'x-location-id': locationId
       },
       body: JSON.stringify({
-        enableCallRecordingDeletion: true,
-        callRecordingRetentionPeriod: 60
+        ...pattern.body,
+        locationId
       })
     });
 
@@ -111,7 +177,7 @@ async function startBulkOperation() {
     debugLog('Processing batch:', batch);
     
     const batchResults = await Promise.all(
-      batch.map(id => performOperation(id, interceptedData.headers))
+      batch.map(id => performOperation(id, interceptedData.headers, interceptedData.featurePattern))
     );
 
     batchResults.forEach(result => {
@@ -146,15 +212,23 @@ async function startBulkOperation() {
 async function initPopup() {
   debugLog('Initializing popup');
   try {
-    const data = await chrome.storage.local.get(['locationIds', 'headers']);
+    const data = await chrome.storage.local.get(['locationIds', 'headers', 'featurePattern', 'isRecording']);
     debugLog('Retrieved data from storage:', data);
     
     interceptedData = {
       locationIds: data.locationIds || [],
-      headers: data.headers || {}
+      headers: data.headers || {},
+      featurePattern: data.featurePattern || null
     };
     
     updateLocationList(interceptedData.locationIds);
+    updateFeaturePattern(interceptedData.featurePattern);
+    
+    if (data.isRecording) {
+      recordFeatureBtn.textContent = 'Stop Recording';
+      recordFeatureBtn.classList.add('recording');
+      recordingStatus.innerHTML = '<p class="status">Recording... Navigate to a location and toggle the feature.</p>';
+    }
   } catch (error) {
     console.error('Error initializing popup:', error);
     errorMessage.textContent = 'Error loading data. Please try again.';
@@ -163,6 +237,31 @@ async function initPopup() {
 
 // Event Listeners
 startOperationBtn.addEventListener('click', startBulkOperation);
+recordFeatureBtn.addEventListener('click', async () => {
+  const isCurrentlyRecording = recordFeatureBtn.textContent === 'Stop Recording';
+  await toggleRecording(!isCurrentlyRecording);
+});
+
+// Listen for storage changes
+chrome.storage.onChanged.addListener((changes, namespace) => {
+  debugLog('Storage changes:', changes);
+  
+  for (const [key, { newValue }] of Object.entries(changes)) {
+    switch (key) {
+      case 'locationIds':
+        interceptedData.locationIds = newValue || [];
+        updateLocationList(interceptedData.locationIds);
+        break;
+      case 'headers':
+        interceptedData.headers = newValue || {};
+        break;
+      case 'featurePattern':
+        interceptedData.featurePattern = newValue || null;
+        updateFeaturePattern(interceptedData.featurePattern);
+        break;
+    }
+  }
+});
 
 // Initialize popup when opened
 document.addEventListener('DOMContentLoaded', initPopup); 
